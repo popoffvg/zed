@@ -2056,7 +2056,12 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
-        let terminal_task = self.create_terminal_shell(working_directory, cx);
+        // This id is written to `sidebar_terminal_threads` and reused on restore,
+        // so a process the shell starts (including `terminal_init_command`) keeps
+        // the same session id after Zed restarts.
+        let mut session_env = HashMap::default();
+        session_env.insert("ZED_SESSION_ID".to_string(), terminal_id.to_string());
+        let terminal_task = self.create_terminal_shell(working_directory, session_env, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
         let project = self.project.downgrade();
@@ -2110,6 +2115,7 @@ impl AgentPanel {
     fn create_terminal_shell(
         &mut self,
         working_directory: Option<PathBuf>,
+        extra_env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<terminal::Terminal>>> {
         // A real shell ties the spawn's timing to the host, so a test that needs
@@ -2124,7 +2130,7 @@ impl AgentPanel {
         }
 
         self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_terminal_shell_with_env(working_directory, extra_env, cx)
         })
     }
 
@@ -7840,9 +7846,10 @@ mod tests {
         cx.executor().allow_parking();
         cx.update(|_, cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
-            // `init_ran_42` is the command's output, not its echoed text, so finding
-            // it proves the shell executed the command rather than just echoing it.
-            settings.terminal_init_command = Some("printf 'init_ran_%s\\n' 42".to_string());
+            // The uuid appears only after the shell executes the command and expands
+            // `$ZED_SESSION_ID`. An echo of the input line still shows the variable name.
+            settings.terminal_init_command =
+                Some("printf 'init_ran_%s\\n' \"$ZED_SESSION_ID\"".to_string());
             AgentSettings::override_global(settings, cx);
 
             // Force a known POSIX shell so the test doesn't depend on the developer's login shell.
@@ -7885,7 +7892,7 @@ mod tests {
             if let Some(terminal) = &terminal
                 && terminal
                     .read_with(&cx, |terminal, _| terminal.get_content())
-                    .contains("init_ran_42")
+                    .contains(&format!("init_ran_{terminal_id}"))
             {
                 break terminal.clone();
             }
@@ -7909,7 +7916,7 @@ mod tests {
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
         assert_eq!(
             input_log,
-            vec![b"printf 'init_ran_%s\\n' 42\r".to_vec()],
+            vec![b"printf 'init_ran_%s\\n' \"$ZED_SESSION_ID\"\r".to_vec()],
             "init command should be written only after terminal startup has settled"
         );
         assert!(
